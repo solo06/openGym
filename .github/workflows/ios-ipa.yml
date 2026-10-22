@@ -1,0 +1,165 @@
+# Builds an installable .ipa for the Capacitor iOS shell in frontend/ios.
+#
+# An IPA can only be produced by Xcode on macOS, so this runs on a GitHub-hosted
+# macOS runner instead of any Linux host.
+#
+# Default output: **unsigned** openGym-unsigned.ipa — sign it locally (Sideloadly,
+# AltStore, Xcode "Install" with a personal team) before installing on a device.
+# For a signed IPA, add these repository secrets and dispatch with signed=true:
+#   IOS_CERT_P12_BASE64        base64 of the .p12 distribution/development cert
+#   IOS_CERT_PASSWORD          password of that .p12
+#   IOS_PROVISION_BASE64       base64 of the .mobileprovision
+#   IOS_TEAM_ID                Apple Developer team id
+#   IOS_KEYCHAIN_PASSWORD      any throwaway password for the temp keychain
+#   IOS_EXPORT_METHOD          development | ad-hoc | app-store | enterprise
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: "Produce a signed IPA (requires the IOS_* secrets)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'ios-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      VITE_MOBILE: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Build web assets and sync the native shell
+        run: npm run build:mobile
+
+      - name: Install CocoaPods dependencies
+        working-directory: frontend/ios/App
+        run: pod install --repo-update
+
+      - name: Import signing identity
+        if: ${{ inputs.signed == true && secrets.IOS_CERT_P12_BASE64 != '' }}
+        env:
+          CERT_P12: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          PROFILE: ${{ secrets.IOS_PROVISION_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE"    | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$RUNNER_TEMP/profile.mobileprovision" \
+             ~/Library/MobileDevice/Provisioning\ Profiles/
+          echo "KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Archive (unsigned)
+        if: ${{ inputs.signed != true || secrets.IOS_CERT_P12_BASE64 == '' }}
+        working-directory: frontend/ios/App
+        run: |
+          set -euo pipefail
+          xcodebuild -workspace App.xcworkspace -list | sed -n '1,40p'
+          if xcodebuild -workspace App.xcworkspace -list | grep -qE '^\s+App$'; then
+            xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+              -sdk iphoneos -destination 'generic/platform=iOS' -quiet \
+              -archivePath "$RUNNER_TEMP/openGym.xcarchive" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              archive
+          else
+            xcodebuild -project App.xcodeproj -target App -configuration Release \
+              -sdk iphoneos -quiet \
+              -archivePath "$RUNNER_TEMP/openGym.xcarchive" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              archive
+          fi
+
+      - name: Archive and export (signed)
+        if: ${{ inputs.signed == true && secrets.IOS_CERT_P12_BASE64 != '' }}
+        working-directory: frontend/ios/App
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+        run: |
+          set -euo pipefail
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -quiet \
+            -archivePath "$RUNNER_TEMP/openGym.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual archive
+          PB=/usr/libexec/PlistBuddy
+          OP="$RUNNER_TEMP/ExportOptions.plist"
+          rm -f "$OP"
+          "$PB" -c "Add :method string ${EXPORT_METHOD:-development}" \
+                 -c "Add :teamID string ${TEAM_ID}" \
+                 -c "Add :signingStyle string manual" \
+                 -c "Add :stripSwiftSymbols bool true" \
+                 -c "Add :compileBitcode bool false" "$OP" >/dev/null
+          "$PB" -c "Print" "$OP"
+          mkdir -p "$RUNNER_TEMP/export"
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/openGym.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          if [ -d "$RUNNER_TEMP/export/Payload" ]; then
+            cd "$RUNNER_TEMP/export"
+            for f in *.ipa; do cp "$f" "$RUNNER_TEMP/openGym-signed.ipa"; done
+            ls -lh "$RUNNER_TEMP/openGym-signed.ipa"
+            echo "IPA_PATH=$RUNNER_TEMP/openGym-signed.ipa" >> "$GITHUB_ENV"
+            echo "IPA_NAME=openGym-signed" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          APP="$RUNNER_TEMP/openGym.xcarchive/Products/Applications/App.app"
+          test -d "$APP" || { echo "no App.app in archive"; ls -R "$RUNNER_TEMP/openGym.xcarchive/Products" | head -40; exit 1; }
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          /usr/bin/zip -qry openGym-unsigned.ipa Payload
+          ls -lh openGym-unsigned.ipa
+          echo "IPA_PATH=$RUNNER_TEMP/openGym-unsigned.ipa" >> "$GITHUB_ENV"
+          echo "IPA_NAME=openGym-unsigned" >> "$GITHUB_ENV"
+
+      - name: Report bundle
+        run: |
+          IPA="$IPA_PATH"
+          unzip -l "$IPA" | sed -n '1,12p'
+          unzip -p "$IPA" 'Payload/App.app/Info.plist' > /tmp/Info.plist || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /tmp/Info.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /tmp/Info.plist 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 14
