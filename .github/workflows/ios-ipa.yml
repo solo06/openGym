@@ -56,8 +56,22 @@ jobs:
         working-directory: frontend/ios/App
         run: pod install --repo-update
 
+      - name: Detect signing secrets
+        id: signing
+        env:
+          CERT: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          WANT_SIGNED: ${{ inputs.signed }}
+        run: |
+          if [ -n "${CERT:-}" ] && [ "${WANT_SIGNED:-false}" = "true" ]; then
+            echo "SIGN=1" >> "$GITHUB_ENV"
+            echo "Signing: enabled"
+          else
+            echo "SIGN=0" >> "$GITHUB_ENV"
+            echo "Signing: disabled (unsigned IPA)"
+          fi
+
       - name: Import signing identity
-        if: ${{ inputs.signed == true && secrets.IOS_CERT_P12_BASE64 != '' }}
+        if: env.SIGN == '1'
         env:
           CERT_P12: ${{ secrets.IOS_CERT_P12_BASE64 }}
           CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
@@ -82,7 +96,7 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
 
       - name: Archive (unsigned)
-        if: ${{ inputs.signed != true || secrets.IOS_CERT_P12_BASE64 == '' }}
+        if: env.SIGN != '1'
         working-directory: frontend/ios/App
         run: |
           set -euo pipefail
@@ -102,7 +116,7 @@ jobs:
           fi
 
       - name: Archive and export (signed)
-        if: ${{ inputs.signed == true && secrets.IOS_CERT_P12_BASE64 != '' }}
+        if: env.SIGN == '1'
         working-directory: frontend/ios/App
         env:
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
